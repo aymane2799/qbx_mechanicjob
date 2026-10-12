@@ -1,7 +1,10 @@
 local config = require 'config.server'
+local clientConfig = require 'config.client'
 local sharedConfig = require 'config.shared'
 local vehicleStatus = {}
 local vehicleDrivingDistance = {}
+local repairGrants = {}
+local lastSpawn = {}
 local stash = {
     id = 'mechanicstash',
     label = locale('labels.stash'),
@@ -15,11 +18,6 @@ exports.ox_inventory:RegisterStash(stash.id, stash.label, stash.slots, stash.wei
 
 -- Functions
 
-local function isVehicleOwned(plate)
-    local count = MySQL.scalar.await('SELECT count(*) from player_vehicles WHERE plate = ?', {plate})
-    return count > 0
-end
-
 local function getVehicleStatus(plate)
     local result = MySQL.query.await('SELECT status FROM player_vehicles WHERE plate = ?', {plate})
     if result[1] and result[1].status then
@@ -27,13 +25,91 @@ local function getVehicleStatus(plate)
     end
 end
 
-local function isAuthorized(citizenId)
-    for i = 1, #config.authorizedIds do
-        if config.authorizedIds[i] == citizenId then
+---@param source number
+---@return boolean
+local function isMechanicOnDuty(source)
+    local player = exports.qbx_core:GetPlayer(source)
+    local job = player and player.PlayerData.job
+    return job ~= nil and job.type == 'mechanic' and job.onduty == true
+end
+
+---@param source number
+---@param coords vector3
+---@param maxDistance number
+---@return boolean
+local function isNear(source, coords, maxDistance)
+    local ped = GetPlayerPed(source)
+    return ped ~= 0 and #(GetEntityCoords(ped) - coords) <= maxDistance
+end
+
+---@param source number
+---@return boolean
+local function isNearLift(source)
+    for i = 1, #sharedConfig.plates do
+        if isNear(source, sharedConfig.plates[i].coords.xyz, config.liftDistance) then
             return true
         end
     end
     return false
+end
+
+---@param plate any
+---@return boolean
+local function isPlate(plate)
+    return type(plate) == 'string' and #plate > 0 and #plate <= 8
+end
+
+---@param value any
+---@return boolean
+local function isNumber(value)
+    return type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+---The player drives a vehicle with the given plate.
+---@param source number
+---@param plate string
+---@return boolean
+local function isDriverOf(source, plate)
+    local ped = GetPlayerPed(source)
+    if ped == 0 then return false end
+
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle == 0 or GetPedInVehicleSeat(vehicle, -1) ~= ped then return false end
+
+    return qbx.getVehiclePlate(vehicle) == plate
+end
+
+---A vehicle with the given plate stands on one of the lifts.
+---@param plate string
+---@return boolean
+local function isOnLift(plate)
+    local vehicles = GetAllVehicles()
+    for i = 1, #vehicles do
+        local vehicle = vehicles[i]
+        if qbx.getVehiclePlate(vehicle) == plate then
+            local coords = GetEntityCoords(vehicle)
+            for j = 1, #sharedConfig.plates do
+                if #(coords - sharedConfig.plates[j].coords.xyz) <= config.liftDistance then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---@param part string
+---@param level number
+---@return number
+local function clampLevel(part, level)
+    local maxLevel = sharedConfig.maxStatusValues[part]
+    return level < 0 and 0 or level > maxLevel and maxLevel or level
+end
+
+---@param source number
+---@param what string
+local function refuse(source, what)
+    lib.print.warn(('qbx_mechanicjob: %s from source %s refused'):format(what, source))
 end
 
 -- Callbacks
@@ -42,45 +118,59 @@ lib.callback.register('qb-vehicletuning:server:GetDrivingDistances', function()
     return vehicleDrivingDistance
 end)
 
-lib.callback.register('qb-vehicletuning:server:IsVehicleOwned', function(_, plate)
-    return MySQL.scalar.await('SELECT 1 from player_vehicles WHERE plate = ?', {plate})
-end)
-
 lib.callback.register('qb-vehicletuning:server:GetAttachedVehicle', function()
     return sharedConfig.plates
 end)
 
-lib.callback.register('qbx_mechanicjob:server:spawnVehicle', function(source, vehicleName, vehicleCoords)
-	local netId = qbx.spawnVehicle({
+lib.callback.register('qbx_mechanicjob:server:spawnVehicle', function(source, vehicleName)
+    if type(vehicleName) ~= 'string' or not clientConfig.vehicles[vehicleName] then
+        return refuse(source, 'spawnVehicle with an unlisted model')
+    end
+    if not isMechanicOnDuty(source) or not isNear(source, sharedConfig.locations.vehicle.xyz, config.garageDistance) then
+        return refuse(source, 'spawnVehicle off duty or away from the garage')
+    end
+
+    local now = os.time()
+    if lastSpawn[source] and now - lastSpawn[source] < config.spawnCooldown then return end
+    lastSpawn[source] = now
+
+    local netId = qbx.spawnVehicle({
         model = joaat(vehicleName),
-        spawnSource = vehicleCoords,
+        spawnSource = sharedConfig.locations.vehicle,
         warp = GetPlayerPed(source)
     })
-	return netId
+    return netId
 end)
 
 lib.callback.register('qbx_mechanicjob:server:checkForItems', function(source, part)
-    local itemName = sharedConfig.repairCostAmount[part].item
-    local amountRequired = sharedConfig.repairCostAmount[part].costs
-    local amount = exports.ox_inventory:Search(source, 'count', itemName)
-    local hasEnough = amount >= amountRequired
-    if hasEnough then
-        exports.ox_inventory:RemoveItem(source, itemName, amountRequired)
+    local cost = type(part) == 'string' and sharedConfig.repairCostAmount[part]
+    if not cost then
+        refuse(source, 'checkForItems with an unknown part')
+        return false
     end
-    return hasEnough
+    if not isMechanicOnDuty(source) or not isNearLift(source) then
+        refuse(source, 'checkForItems off duty or away from a lift')
+        return false
+    end
+
+    local amount = exports.ox_inventory:Search(source, 'count', cost.item)
+    if amount < cost.costs or not exports.ox_inventory:RemoveItem(source, cost.item, cost.costs) then
+        return false
+    end
+
+    -- What was paid for: one repair of this part, used by the updatePart that follows the progress bar.
+    repairGrants[source] = {part = part, expires = os.time() + config.repairGrantSeconds}
+    return true
 end)
 
 -- Events
 
-RegisterNetEvent('qb-vehicletuning:server:SaveVehicleProps', function(vehicleProps)
-    if not isVehicleOwned(vehicleProps.plate) then return end
-
-    MySQL.update.await('UPDATE player_vehicles SET mods = ? WHERE plate = ?', {json.encode(vehicleProps), vehicleProps.plate})
-end)
-
 RegisterNetEvent('vehiclemod:server:setupVehicleStatus', function(plate, engineHealth, bodyHealth)
-    engineHealth = engineHealth or 1000.0
-    bodyHealth = bodyHealth or 1000.0
+    local src = source
+    if not isPlate(plate) or not isDriverOf(src, plate) then return end
+
+    engineHealth = isNumber(engineHealth) and clampLevel('engine', engineHealth) or sharedConfig.maxStatusValues.engine
+    bodyHealth = isNumber(bodyHealth) and clampLevel('body', bodyHealth) or sharedConfig.maxStatusValues.body
 
     local statusInfo = vehicleStatus[plate] or getVehicleStatus(plate) or
         {
@@ -97,37 +187,37 @@ RegisterNetEvent('vehiclemod:server:setupVehicleStatus', function(plate, engineH
     TriggerClientEvent("vehiclemod:client:setVehicleStatus", -1, plate, statusInfo)
 end)
 
-RegisterNetEvent('qb-vehicletuning:server:UpdateDrivingDistance', function(amount, plate)
-    vehicleDrivingDistance[plate] = amount
-    TriggerClientEvent('qb-vehicletuning:client:UpdateDrivingDistance', -1, vehicleDrivingDistance[plate], plate)
-    local result = MySQL.query.await('SELECT plate FROM player_vehicles WHERE plate = ?', {plate})
-    if not result[1] then return end
-
-    MySQL.update.await('UPDATE player_vehicles SET drivingdistance = ? WHERE plate = ?', {amount, plate})
-end)
-
-RegisterNetEvent('qb-vehicletuning:server:LoadStatus', function(veh, plate) -- Used in old qb-garages
-    vehicleStatus[plate] = veh
-    TriggerClientEvent("vehiclemod:client:setVehicleStatus", -1, plate, veh)
-end)
-
+-- Three senders are accepted. The driver of the vehicle reports its engine and body health. A mechanic who
+-- has just paid for a part (checkForItems) repairs that part of a vehicle standing on a lift, to its maximum.
+-- Staff who may use /setvehiclestatus set any part of the vehicle they drive.
 RegisterNetEvent('vehiclemod:server:updatePart', function(plate, part, level)
+    local src = source
+    if not isPlate(plate) or type(part) ~= 'string' or not sharedConfig.maxStatusValues[part] or not isNumber(level) then return end
     if not vehicleStatus[plate] then return end
 
-    local maxLevel = (part == "engine" or part == "body") and 1000 or 100
-    vehicleStatus[plate][part] = level < 0 and 0 or level > maxLevel and maxLevel or level
-    TriggerClientEvent("vehiclemod:client:setVehicleStatus", -1, plate, vehicleStatus[plate])
-end)
+    local grant = repairGrants[src]
+    if grant and grant.part == part then
+        repairGrants[src] = nil
+        if os.time() > grant.expires or not isMechanicOnDuty(src) or not isOnLift(plate) then
+            return refuse(src, ('repair of %s'):format(part))
+        end
+        level = sharedConfig.maxStatusValues[part]
+    elseif not isDriverOf(src, plate) then
+        return
+    elseif part ~= 'engine' and part ~= 'body' and not IsPlayerAceAllowed(src, 'command.setvehiclestatus') then
+        return refuse(src, ('updatePart of %s'):format(part))
+    end
 
-RegisterNetEvent('qb-vehicletuning:server:SetPartLevel', function(plate, part, level)
-    if not vehicleStatus[plate] then return end
-
-    vehicleStatus[plate][part] = level
+    vehicleStatus[plate][part] = clampLevel(part, level)
     TriggerClientEvent("vehiclemod:client:setVehicleStatus", -1, plate, vehicleStatus[plate])
 end)
 
 RegisterNetEvent('vehiclemod:server:fixEverything', function(plate)
-    if not vehicleStatus[plate] then return end
+    local src = source
+    if not isPlate(plate) or not vehicleStatus[plate] then return end
+    if not IsPlayerAceAllowed(src, 'command.setvehiclestatus') or not isDriverOf(src, plate) then
+        return refuse(src, 'fixEverything')
+    end
 
     for k, v in pairs(sharedConfig.maxStatusValues) do
         vehicleStatus[plate][k] = v
@@ -136,17 +226,21 @@ RegisterNetEvent('vehiclemod:server:fixEverything', function(plate)
     TriggerClientEvent("vehiclemod:client:setVehicleStatus", -1, plate, vehicleStatus[plate])
 end)
 
-RegisterNetEvent('vehiclemod:server:saveStatus', function(plate) -- Used in old qb-garages
-    if not vehicleStatus[plate] then return end
+RegisterNetEvent('qb-vehicletuning:server:SetAttachedVehicle', function(k, veh)
+    local src = source
+    local plate = math.type(k) == 'integer' and sharedConfig.plates[k]
+    if not plate or (veh ~= false and math.type(veh) ~= 'integer') then return end
+    if not isMechanicOnDuty(src) or not isNear(src, plate.coords.xyz, config.liftDistance) then
+        return refuse(src, 'SetAttachedVehicle')
+    end
 
-    MySQL.update.await('UPDATE player_vehicles SET status = ? WHERE plate = ?', { json.encode(vehicleStatus[plate]), plate })
+    plate.AttachedVehicle = veh
+    TriggerClientEvent('qb-vehicletuning:client:SetAttachedVehicle', -1, veh, k)
 end)
 
-RegisterNetEvent('qb-vehicletuning:server:SetAttachedVehicle', function(k, veh)
-    if not sharedConfig.plates[k] then return end
-
-    sharedConfig.plates[k].AttachedVehicle = veh
-    TriggerClientEvent('qb-vehicletuning:client:SetAttachedVehicle', -1, veh, k)
+AddEventHandler('playerDropped', function()
+    repairGrants[source] = nil
+    lastSpawn[source] = nil
 end)
 
 -- Commands
@@ -165,69 +259,10 @@ lib.addCommand('setvehiclestatus', {
             help = 'The Percentage Fixed',
         },
     },
-    restricted = 'group.god'
+    restricted = 'group.admin'
 }, function(source, args)
     local part = args.part:lower()
     local level = args.amount
+    if not sharedConfig.maxStatusValues[part] then return end
     TriggerClientEvent("vehiclemod:client:setPartLevel", source, part, level)
-end)
-
-lib.addCommand('setmechanic', {
-    help = 'Give Someone The Mechanic job',
-    params = {
-        {
-            name = 'target',
-            type = 'playerId',
-            help = 'ID Of The Player',
-        },
-    },
-}, function(source, args)
-    local player = exports.qbx_core:GetPlayer(source)
-
-    if isAuthorized(player.PlayerData.citizenid) then
-        if args.target then
-            local targetData = exports.qbx_core:GetPlayer(args.target)
-            if targetData then
-                targetData.Functions.SetJob("mechanic")
-                TriggerClientEvent('QBCore:Notify', targetData.PlayerData.source, "You Were Hired As An Autocare Employee!")
-                TriggerClientEvent('QBCore:Notify', source, "You have (" .. targetData.PlayerData.charinfo.firstname .. ") Hired As An Autocare Employee!")
-            end
-        else
-            TriggerClientEvent('QBCore:Notify', source, "You Must Provide A Player ID!")
-        end
-    else
-        TriggerClientEvent('QBCore:Notify', source, "You Cannot Do This!", "error")
-    end
-end)
-
-lib.addCommand('firemechanic', {
-    help = 'Fire A Mechanic',
-    params = {
-        {
-            name = 'target',
-            type = 'playerId',
-            help = 'ID Of The Player',
-        },
-    },
-}, function(source, args)
-    local player = exports.qbx_core:GetPlayer(source)
-
-    if isAuthorized(player.PlayerData.citizenid) then
-        if args.target then
-            local TargetData = exports.qbx_core:GetPlayer(args.target)
-            if TargetData then
-                if TargetData.PlayerData.job.name == "mechanic" then
-                    TargetData.Functions.SetJob("unemployed")
-                    TriggerClientEvent('QBCore:Notify', TargetData.PlayerData.source,  "You Were Fired As An Autocare Employee!")
-                    TriggerClientEvent('QBCore:Notify', source, "You have (" .. TargetData.PlayerData.charinfo.firstname .. ") Fired As Autocare Employee!")
-                else
-                    TriggerClientEvent('QBCore:Notify', source, "Youre Not An Employee of Autocare!", "error")
-                end
-            end
-        else
-            TriggerClientEvent('QBCore:Notify', source, "You Must Provide A Player ID!", "error")
-        end
-    else
-        TriggerClientEvent('QBCore:Notify', source, "You Cannot Do This!", "error")
-    end
 end)

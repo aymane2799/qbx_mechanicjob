@@ -446,7 +446,8 @@ local function resetClosestVehiclePlate()
 end
 
 local function spawnListVehicle(model)
-    local netId = lib.callback.await('qbx_mechanicjob:server:spawnVehicle', false, model, sharedConfig.locations.vehicle, true)
+    local netId = lib.callback.await('qbx_mechanicjob:server:spawnVehicle', false, model)
+    if not netId then return end
     local timeout = 100
     while not NetworkDoesEntityExistWithNetworkId(netId) and timeout > 0 do
         Wait(10)
