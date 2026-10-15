@@ -5,6 +5,10 @@ local vehicleStatus = {}
 local vehicleDrivingDistance = {}
 local repairGrants = {}
 local lastSpawn = {}
+-- Atlas fork: the work vehicle of each mechanic (net id by citizenid), returned at the dispatcher.
+local workVehicles = {}
+-- How far from its parking spot (locations.vehicle) a work vehicle may stand when it is returned.
+local returnRange = 40.0
 local stash = {
     id = 'mechanicstash',
     label = locale('labels.stash'),
@@ -126,8 +130,16 @@ lib.callback.register('qbx_mechanicjob:server:spawnVehicle', function(source, ve
     if type(vehicleName) ~= 'string' or not clientConfig.vehicles[vehicleName] then
         return refuse(source, 'spawnVehicle with an unlisted model')
     end
-    if not isMechanicOnDuty(source) or not isNear(source, sharedConfig.locations.vehicle.xyz, config.garageDistance) then
+    -- Atlas fork: taken at the dispatcher, one work vehicle per mechanic.
+    if not isMechanicOnDuty(source) or not isNear(source, sharedConfig.locations.dispatcher.coords.xyz, config.garageDistance) then
         return refuse(source, 'spawnVehicle off duty or away from the garage')
+    end
+
+    local citizenid = exports.qbx_core:GetPlayer(source).PlayerData.citizenid
+    local current = workVehicles[citizenid] and NetworkGetEntityFromNetworkId(workVehicles[citizenid])
+    if current and current ~= 0 and DoesEntityExist(current) then
+        exports.qbx_core:Notify(source, locale('notifications.vehicle_already_out'), 'error')
+        return
     end
 
     local now = os.time()
@@ -139,7 +151,37 @@ lib.callback.register('qbx_mechanicjob:server:spawnVehicle', function(source, ve
         spawnSource = sharedConfig.locations.vehicle,
         warp = GetPlayerPed(source)
     })
+    workVehicles[citizenid] = netId
     return netId
+end)
+
+-- Atlas fork: the work vehicle is returned at the dispatcher, on foot. Upstream deleted the vehicle the
+-- client sat in, wherever it was. Here the server refuses while the vehicle is away from the garage and
+-- deletes it itself.
+---@return boolean returned
+lib.callback.register('qbx_mechanicjob:server:returnVehicle', function(source)
+    if not isMechanicOnDuty(source) or not isNear(source, sharedConfig.locations.dispatcher.coords.xyz, config.garageDistance) then
+        refuse(source, 'returnVehicle off duty or away from the garage')
+        return false
+    end
+
+    local citizenid = exports.qbx_core:GetPlayer(source).PlayerData.citizenid
+    local netId = workVehicles[citizenid]
+    local vehicle = netId and NetworkGetEntityFromNetworkId(netId)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then
+        workVehicles[citizenid] = nil
+        exports.qbx_core:Notify(source, locale('notifications.no_work_vehicle'), 'error')
+        return false
+    end
+
+    if #(GetEntityCoords(vehicle) - sharedConfig.locations.vehicle.xyz) > returnRange then
+        exports.qbx_core:Notify(source, locale('notifications.vehicle_too_far'), 'error')
+        return false
+    end
+
+    DeleteEntity(vehicle)
+    workVehicles[citizenid] = nil
+    return true
 end)
 
 lib.callback.register('qbx_mechanicjob:server:checkForItems', function(source, part)

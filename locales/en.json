@@ -20,7 +20,9 @@
         "stash": "Mechanic Stash",
         "status": "Status",
         "vehicle_title": "Vehicle: %s",
-        "vehicle_list": "Vehicle List"
+        "vehicle_list": "Vehicle List",
+        "take_vehicle": "Take a work vehicle",
+        "return_vehicle": "Return the work vehicle"
     },
 
     "lift_menu": {
@@ -66,6 +68,10 @@
         "progress_bar": "Repairing vehicle..",
         "process_canceled": "Proccess canceled",
         "not_part": "Not a valid part",
-        "partrep":"The %s has been repaired!"
+        "partrep":"The %s has been repaired!",
+        "vehicle_returned": "Work vehicle returned",
+        "vehicle_already_out": "You already have a work vehicle out",
+        "no_work_vehicle": "You have no work vehicle to return",
+        "vehicle_too_far": "Bring the work vehicle back to the garage first"
     }
 }

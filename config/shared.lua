@@ -69,6 +69,13 @@ return {
         },
     },
     locations = {
+        -- Atlas fork: the dispatcher of the garage, at the old duty point; z is one below that point. Signing
+        -- in and off and the work vehicles are the options of this ped (ox_target). Not seen in game.
+        dispatcher = {
+            model = 's_m_m_autoshop_01',
+            coords = vec4(-323.30, -128.79, 38.02, 160.0),
+            scenario = 'WORLD_HUMAN_CLIPBOARD',
+        },
         exit = vec3(-339.04, -135.53, 39.00),
         duty = vec3(-323.30, -128.79, 39.02),
         stash = vec3(-319.19, -131.90, 37.98),

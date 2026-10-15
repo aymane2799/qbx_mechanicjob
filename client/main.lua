@@ -5,7 +5,7 @@ VehicleStatus = {}
 
 -- zone check
 local plateZones = {}
-local dutyTargetBoxId = 'dutyTarget'
+local depotPed
 local stashTargetBoxId = 'stashTarget'
 
 -- Exports
@@ -46,67 +46,6 @@ local function deleteTarget(id)
     end
 
     config.targets[id] = nil
-end
-
-local function registerDutyTarget()
-    local coords = sharedConfig.locations.duty
-    local boxData = config.targets[dutyTargetBoxId] or {}
-
-    if boxData?.created then
-        return
-    end
-
-    if QBX.PlayerData.job.type ~= 'mechanic' then
-        return
-    end
-
-    local label = QBX.PlayerData.job.onduty and locale('labels.sign_off') or locale('labels.sign_in')
-
-    if config.useTarget then
-        dutyTargetBoxId = exports.ox_target:addBoxZone({
-            coords = coords,
-            size = vec3(2.5, 1.5, 1),
-            rotation = 338.16,
-            debug = config.debugPoly,
-            options = {{
-                label = label,
-                name = dutyTargetBoxId,
-                icon = 'fa fa-clipboard',
-                distance = 2.0,
-                serverEvent = "QBCore:ToggleDuty",
-                canInteract = function()
-                    return QBX.PlayerData.job.type == 'mechanic'
-                end
-            }},
-        })
-
-        config.targets[dutyTargetBoxId] = {created = true}
-    else
-        local zone = lib.zones.box({
-            coords = coords,
-            size = vec3(1.5, 2, 2),
-            rotation = 338.16,
-            debug = config.debugPoly,
-            inside = function()
-                if QBX.PlayerData.job.type == 'mechanic' then
-                    if IsControlJustPressed(0, 38) then
-                        TriggerServerEvent("QBCore:ToggleDuty")
-                        Wait(500)
-                    end
-                end
-            end,
-            onEnter = function()
-                if QBX.PlayerData.job.type == 'mechanic' then
-                    lib.showTextUI("[E] " .. label, {position = 'left-center'})
-                end
-            end,
-            onExit = function()
-                lib.hideTextUI()
-            end,
-        })
-
-        config.targets[dutyTargetBoxId] = {created = true, zone = zone}
-    end
 end
 
 local function registerStashTarget()
@@ -166,45 +105,6 @@ local function registerStashTarget()
 
         config.targets[stashTargetBoxId] = {created = true, zone = zone}
     end
-end
-
-local function registerGarageZone()
-    local coords = sharedConfig.locations.vehicle
-    local veh = cache.vehicle
-
-    lib.zones.box({
-        coords = coords.xyz,
-        size = vec3(15, 5, 6),
-        rotation = 340.0,
-        debug = config.debugPoly,
-        inside = function()
-            if QBX.PlayerData.job.onduty and QBX.PlayerData.job.type == 'mechanic' then
-                if IsControlJustPressed(0, 38) then
-                    if veh then
-                        DeleteVehicle(veh)
-                        lib.hideTextUI()
-                    else
-                        lib.showContext('mechanicVehicles')
-                        lib.hideTextUI()
-                    end
-                    Wait(500)
-                end
-            end
-        end,
-        onEnter = function()
-            if QBX.PlayerData.job.onduty and QBX.PlayerData.job.type == 'mechanic' then
-                local inVehicle = cache.vehicle
-                if inVehicle then
-                    lib.showTextUI(locale('labels.h_vehicle'), {position = 'left-center'})
-                else
-                    lib.showTextUI(locale('labels.g_vehicle'), {position = 'left-center'})
-                end
-            end
-        end,
-        onExit = function()
-            lib.hideTextUI()
-        end,
-    })
 end
 
 local closestPlate = nil
@@ -481,8 +381,6 @@ AddEventHandler('onResourceStart', function(resource)
     if resource ~= GetCurrentResourceName() then return end
 
     createBlip()
-    registerGarageZone()
-    registerDutyTarget()
     registerStashTarget()
     setVehiclePlateZones()
     if QBX.PlayerData.job.onduty and QBX.PlayerData.job.type == 'mechanic' then
@@ -502,8 +400,6 @@ end)
 
 AddEventHandler('QBCore:Client:OnPlayerLoaded', function()
     createBlip()
-    registerGarageZone()
-    registerDutyTarget()
     registerStashTarget()
     setVehiclePlateZones()
     if QBX.PlayerData.job.onduty and QBX.PlayerData.job.type == 'mechanic' then
@@ -522,14 +418,11 @@ AddEventHandler('QBCore:Client:OnPlayerLoaded', function()
 end)
 
 local function updateJobActions()
-    deleteTarget(dutyTargetBoxId)
     deleteTarget(stashTargetBoxId)
     
      Wait(2000) -- wait 2s to preventing bug on zone creation interator
     
     if QBX.PlayerData.job.type == 'mechanic' then
-        registerDutyTarget()
-    
         if not QBX.PlayerData.job.onduty then return end
         registerStashTarget()
     end
@@ -639,3 +532,92 @@ end
 
 registerLiftMenu()
 registerVehicleListMenu()
+
+-- Atlas fork: the dispatcher of the garage replaces the duty zone and the vehicle zone. Signing in and off,
+-- taking a work vehicle, and returning it are options of this ped (ox_target), for mechanics only; the server
+-- measures the distance to it and deletes the returned vehicle itself. The ped is local and exists only
+-- while the player is near the garage.
+local function isOnDuty()
+    return QBX.PlayerData.job.onduty
+end
+
+local function returnWorkVehicle()
+    if lib.callback.await('qbx_mechanicjob:server:returnVehicle', false) then
+        exports.qbx_core:Notify(locale('notifications.vehicle_returned'), 'success')
+    end
+end
+
+local function removeDepotPed()
+    if not depotPed then return end
+
+    exports.ox_target:removeLocalEntity(depotPed)
+    if DoesEntityExist(depotPed) then DeletePed(depotPed) end
+    depotPed = nil
+end
+
+local function spawnDepotPed()
+    if depotPed then return end
+
+    local data = sharedConfig.locations.dispatcher
+    local model = lib.requestModel(data.model, 10000)
+    depotPed = CreatePed(0, model, data.coords.x, data.coords.y, data.coords.z, data.coords.w, false, false)
+    SetModelAsNoLongerNeeded(model)
+    FreezeEntityPosition(depotPed, true)
+    SetEntityInvincible(depotPed, true)
+    SetBlockingOfNonTemporaryEvents(depotPed, true)
+
+    if data.scenario then
+        TaskStartScenarioInPlace(depotPed, data.scenario, 0, true)
+    end
+
+    exports.ox_target:addLocalEntity(depotPed, {
+        {
+            name = 'mechanic_sign_in',
+            label = locale('labels.sign_in'),
+            icon = 'fa-solid fa-clipboard',
+            groups = 'mechanic',
+            distance = 2.5,
+            canInteract = function() return not isOnDuty() end,
+            serverEvent = 'QBCore:ToggleDuty',
+        },
+        {
+            name = 'mechanic_sign_off',
+            label = locale('labels.sign_off'),
+            icon = 'fa-solid fa-clipboard',
+            groups = 'mechanic',
+            distance = 2.5,
+            canInteract = isOnDuty,
+            serverEvent = 'QBCore:ToggleDuty',
+        },
+        {
+            name = 'mechanic_take_vehicle',
+            label = locale('labels.take_vehicle'),
+            icon = 'fa-solid fa-truck-pickup',
+            groups = 'mechanic',
+            distance = 2.5,
+            canInteract = isOnDuty,
+            onSelect = function() lib.showContext('mechanicVehicles') end,
+        },
+        {
+            name = 'mechanic_return_vehicle',
+            label = locale('labels.return_vehicle'),
+            icon = 'fa-solid fa-warehouse',
+            groups = 'mechanic',
+            distance = 2.5,
+            canInteract = isOnDuty,
+            onSelect = returnWorkVehicle,
+        },
+    })
+end
+
+lib.points.new({
+    coords = sharedConfig.locations.dispatcher.coords.xyz,
+    distance = 60.0,
+    onEnter = spawnDepotPed,
+    onExit = removeDepotPed,
+})
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= cache.resource then return end
+    removeDepotPed()
+end)

@@ -20,7 +20,9 @@
         "stash": "Coffre du mécanicien",
         "status": "État",
         "vehicle_title": "Véhicule : %s",
-        "vehicle_list": "Liste des véhicules"
+        "vehicle_list": "Liste des véhicules",
+        "take_vehicle": "Prendre un véhicule de travail",
+        "return_vehicle": "Rendre le véhicule de travail"
     },
 
     "lift_menu": {
@@ -66,6 +68,10 @@
         "progress_bar": "Réparation du véhicule...",
         "process_canceled": "Processus annulé",
         "not_part": "Pièce non valide",
-        "partrep":"Le %s a été réparé !"
+        "partrep":"Le %s a été réparé !",
+        "vehicle_returned": "Véhicule de travail rendu",
+        "vehicle_already_out": "Vous avez déjà un véhicule de travail sorti",
+        "no_work_vehicle": "Vous n'avez pas de véhicule de travail à rendre",
+        "vehicle_too_far": "Ramenez d'abord le véhicule de travail au garage"
     }
 }
